@@ -1,5 +1,20 @@
 # Markdown Rich Review for GitHub Pull Requests
 
+> **Quadric fork.** This is a fork of [sabbour/md-review-extension](https://github.com/sabbour/md-review-extension)
+> with fixes for spec-style markdown PRs:
+> - Click-to-source now resolves correctly for paragraphs containing inline LaTeX (`$...$`).
+> - Multi-line (soft-wrapped) paragraphs route clicks to the specific source line clicked,
+>   not just the paragraph's first line.
+> - Selected-line highlight is dark-theme readable (translucent blue instead of pale yellow).
+>
+> **Install (Quadric coworkers):**
+> 1. `git clone git@github.com:thomassng/md-review-extension.git ~/extensions/md-review-extension`
+> 2. Open `chrome://extensions` → toggle **Developer mode** on.
+> 3. Click **Load unpacked**, point at `~/extensions/md-review-extension`.
+> 4. To update later: `cd` to the directory, `git pull`, then click the reload icon on the extension's card.
+>
+> Updates from upstream sabbour land via `git fetch upstream && git merge upstream/main`. Ping Thomas if you need help.
+
 A Chrome / Microsoft Edge extension (MV3) that enhances the GitHub Pull Request **Files changed** view for Markdown files.
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
