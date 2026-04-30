@@ -127,6 +127,66 @@
       .trim();
   }
 
+  // Walk up to find a block-level container. Element.closest() doesn't
+  // reliably cross MathML/HTML boundaries inside <math-renderer>, so a
+  // direct click on `$\binom{C}{1}$` lands on an <mo> with closest("p") ==
+  // null. Walk parentElement explicitly (and traverse shadow hosts) until
+  // we hit a paragraph-level block.
+  function _findClickedBlock(target) {
+    const BLOCK_TAGS = new Set([
+      "LI", "P", "H1", "H2", "H3", "H4", "H5", "H6", "TR", "TD", "TH",
+      "BLOCKQUOTE", "PRE",
+    ]);
+    let node = target;
+    while (node) {
+      const tag = (node.tagName || "").toUpperCase();
+      if (BLOCK_TAGS.has(tag)) return node;
+      // Display math: <math-renderer class="js-display-math"> is a
+      // top-level block (no enclosing <p>). Treat as a block target so
+      // we can route the click to the source $$...$$ block.
+      if (tag === "MATH-RENDERER" && node.classList?.contains("js-display-math")) {
+        return node;
+      }
+      if (node.parentElement) {
+        node = node.parentElement;
+        continue;
+      }
+      const root = node.getRootNode?.();
+      node = (root && root.host) || null;
+    }
+    return null;
+  }
+
+  // Walk lineList counting display-math blocks (GitHub's ```math ... ```
+  // fenced blocks, or $$...$$ delimiters); return the first content line
+  // of the targetIdx-th block.
+  function _findNthDisplayMathLine(lineList, targetIdx) {
+    if (!Array.isArray(lineList) || targetIdx < 0) return null;
+    let inMath = false;
+    let blockIdx = -1;
+    for (const entry of lineList) {
+      const raw = (entry.raw || "").trim();
+      if (!inMath) {
+        // Opening marker: ```math or $$
+        if (/^```\s*math\s*$/.test(raw) || raw === "$$") {
+          inMath = true;
+          blockIdx++;
+          continue;
+        }
+      } else {
+        // Closing marker: ``` (any close fence) or $$
+        if (/^```\s*$/.test(raw) || raw === "$$") {
+          inMath = false;
+          continue;
+        }
+      }
+      if (inMath && blockIdx === targetIdx && raw.length > 0) {
+        return entry.lineNum;
+      }
+    }
+    return null;
+  }
+
   // Read text from a block element with rendered-math nodes removed, so the
   // result aligns with what _stripMarkdownSyntax produces for the source line.
   function _readBlockTextStrippingMath(el) {
@@ -564,6 +624,7 @@
     if (!fileContent) return [];
     return fileContent.split("\n").map((line, i) => ({
       lineNum: i + 1,
+      raw: line,
       stripped: _normalizeTextForMatch(_stripMarkdownSyntax(line)),
     }));
   }
@@ -1199,12 +1260,26 @@
       e.preventDefault();
       e.stopPropagation();
 
-      const blockTarget = e.target.closest("li, p, h1, h2, h3, h4, h5, h6, tr, blockquote, pre") || e.target;
+      const blockTarget = _findClickedBlock(e.target) || e.target;
       const clickedText = _readBlockTextStrippingMath(blockTarget);
       console.log("[MD Review] Click on:", blockTarget.tagName, clickedText.substring(0, 80));
 
       // Prefer source position data when available.
       let lineNum = _parseSourcePosLine(blockTarget);
+
+      // Display math: <math-renderer class="js-display-math"> doesn't have
+      // enclosing prose to match against, so map by index to the Nth $$...$$
+      // block in the source.
+      if (!lineNum &&
+          blockTarget.tagName?.toLowerCase() === "math-renderer" &&
+          blockTarget.classList?.contains("js-display-math")) {
+        const allDisplay = article.querySelectorAll("math-renderer.js-display-math");
+        const idx = Array.from(allDisplay).indexOf(blockTarget);
+        const lineList = _lineListByDigest.get(pathDigest);
+        if (idx >= 0 && lineList) {
+          lineNum = _findNthDisplayMathLine(lineList, idx);
+        }
+      }
 
       // Otherwise find best textual match.
       if (!lineNum) {
