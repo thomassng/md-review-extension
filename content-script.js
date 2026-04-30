@@ -89,6 +89,10 @@
   const _fileCache = new Map();
   const _fileRetryAfter = new Map();
   const _lineMapByDigest = new Map();
+  // Ordered list of {lineNum, stripped} per file, used for caret-position
+  // refinement of multi-line paragraph clicks. Same source as lineMap, just
+  // preserving file order.
+  const _lineListByDigest = new Map();
   const _localCommentActivityByDigest = new Map();
   const _suppressedCommentLinesByDigest = new Map();
   let _commentActivityTrackingInstalled = false;
@@ -107,6 +111,11 @@
 
   function _stripMarkdownSyntax(text) {
     return text
+      // LaTeX math: $$...$$ and $...$ — rendered HTML's textContent for these
+      // is unstable (mjx-container produces stacked atoms), so drop the math
+      // entirely on both sides for matching.
+      .replace(/\$\$[\s\S]*?\$\$/g, "")
+      .replace(/\$[^$\n]*\$/g, "")
       .replace(/^#{1,6}\s+/, "")
       .replace(/^\*\s+/, "")
       .replace(/^-\s+/, "")
@@ -116,6 +125,23 @@
       .replace(/`/g, "")
       .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
       .trim();
+  }
+
+  // Read text from a block element with rendered-math nodes removed, so the
+  // result aligns with what _stripMarkdownSyntax produces for the source line.
+  function _readBlockTextStrippingMath(el) {
+    if (!el) return "";
+    const clone = el.cloneNode(true);
+    clone.querySelectorAll(
+      // GitHub's actual renderers (MathML via <math-renderer>):
+      'math-renderer, math, .js-inline-math, .js-display-math, ' +
+      // MathJax variants (defensive — covers other hosts):
+      'mjx-container, mjx-math, .MathJax, .MathJax_Display, .MathJax_Preview, ' +
+      // KaTeX (defensive):
+      '.katex, ' +
+      '[data-math-style]'
+    ).forEach((n) => n.replaceWith(document.createTextNode(" ")));
+    return (clone.textContent || "").trim();
   }
 
   function _isCommitOid(value) {
@@ -528,6 +554,77 @@
       if (rendered !== raw) _addLineMapEntry(lineMap, rendered, lineNum);
     }
     return lineMap;
+  }
+
+  /**
+   * Build an ordered list of {lineNum, stripped} matching the file order,
+   * for caret-offset refinement within multi-line paragraphs.
+   */
+  function _buildLineList(fileContent) {
+    if (!fileContent) return [];
+    return fileContent.split("\n").map((line, i) => ({
+      lineNum: i + 1,
+      stripped: _normalizeTextForMatch(_stripMarkdownSyntax(line)),
+    }));
+  }
+
+  function _getCaretRange(e) {
+    if (document.caretRangeFromPoint) {
+      return document.caretRangeFromPoint(e.clientX, e.clientY);
+    }
+    if (document.caretPositionFromPoint) {
+      const pos = document.caretPositionFromPoint(e.clientX, e.clientY);
+      if (!pos) return null;
+      const r = document.createRange();
+      r.setStart(pos.offsetNode, pos.offset);
+      r.setEnd(pos.offsetNode, pos.offset);
+      return r;
+    }
+    return null;
+  }
+
+  function _strippedTextBeforeCaret(blockTarget, caretRange) {
+    if (!blockTarget || !caretRange) return null;
+    const preRange = document.createRange();
+    preRange.selectNodeContents(blockTarget);
+    try {
+      preRange.setEnd(caretRange.startContainer, caretRange.startOffset);
+    } catch (err) {
+      return null;
+    }
+    const fragment = preRange.cloneContents();
+    const tempDiv = document.createElement("div");
+    tempDiv.appendChild(fragment);
+    tempDiv.querySelectorAll(
+      'math-renderer, math, .js-inline-math, .js-display-math, ' +
+      'mjx-container, mjx-math, .MathJax, .MathJax_Display, .MathJax_Preview, ' +
+      '.katex, [data-math-style]'
+    ).forEach((n) => n.replaceWith(document.createTextNode(" ")));
+    return _normalizeTextForMatch(tempDiv.textContent || "");
+  }
+
+  /**
+   * When startLineNum is the first source line of a multi-line paragraph,
+   * walk forward through lineList summing stripped lengths until we cross
+   * the caret offset (preTextLength). Stops at a blank source line so we
+   * don't cross paragraph boundaries.
+   */
+  function _refineLineByCaretOffset(startLineNum, preTextLength, lineList) {
+    if (!startLineNum || !Array.isArray(lineList)) return startLineNum;
+    if (!Number.isInteger(preTextLength) || preTextLength <= 0) return startLineNum;
+
+    let cumulative = 0;
+    for (let i = startLineNum - 1; i < lineList.length; i++) {
+      const entry = lineList[i];
+      if (!entry) continue;
+      const lineLen = (entry.stripped || "").length;
+      if (lineLen === 0) break; // blank line ends paragraph
+      if (cumulative + lineLen >= preTextLength) {
+        return entry.lineNum;
+      }
+      cumulative += lineLen + 1; // +1 for joining whitespace
+    }
+    return startLineNum;
   }
 
   function _parseSourcePosLine(element) {
@@ -953,6 +1050,7 @@
       const fileContent = await _fetchFileContent(filePath, container);
       const lineMap = _buildFullLineMap(fileContent);
       _lineMapByDigest.set(pathDigest, lineMap);
+      _lineListByDigest.set(pathDigest, _buildLineList(fileContent));
       console.log("[MD Review] Full lineMap for", filePath, ":", lineMap.size, "keys");
 
       _makeClickable(article, pathDigest, lineMap, markersMap);
@@ -1030,6 +1128,24 @@
       return null;
     }
 
+    // Prefix match — when a markdown paragraph is soft-wrapped across multiple
+    // source lines, those lines render as one <p>. The lineMap has each source
+    // line keyed individually, so the first source line should be a prefix of
+    // the clicked paragraph's text. Pick the longest such prefix match.
+    if (firstLine.length >= minSubstringLength) {
+      let prefixMatch = null;
+      let prefixLen = 0;
+      for (const [mapText, mapLines] of lineMap) {
+        if (mapLines.length !== 1) continue;
+        if (mapText.length < 12) continue; // too short to be reliable
+        if (firstLine.startsWith(mapText) && mapText.length > prefixLen) {
+          prefixMatch = mapLines[0];
+          prefixLen = mapText.length;
+        }
+      }
+      if (prefixMatch) return prefixMatch;
+    }
+
     // Substring match — find best (longest) match
     const words = firstLine.split(" ").filter(Boolean);
     if (firstLine.length < minSubstringLength || words.length < minWordCount) {
@@ -1084,7 +1200,7 @@
       e.stopPropagation();
 
       const blockTarget = e.target.closest("li, p, h1, h2, h3, h4, h5, h6, tr, blockquote, pre") || e.target;
-      const clickedText = (blockTarget.textContent || "").trim();
+      const clickedText = _readBlockTextStrippingMath(blockTarget);
       console.log("[MD Review] Click on:", blockTarget.tagName, clickedText.substring(0, 80));
 
       // Prefer source position data when available.
@@ -1104,7 +1220,7 @@
       if (!lineNum) {
         let parent = blockTarget.parentElement;
         while (parent && parent !== article) {
-          const parentText = (parent.textContent || "").trim().split("\n")[0].trim();
+          const parentText = _readBlockTextStrippingMath(parent).split("\n")[0].trim();
           lineNum = _parseSourcePosLine(parent) || _findBestLineMatch(parentText, lineMap, {
             allowSubstring: true,
             preferUnique: true,
@@ -1121,6 +1237,24 @@
       if (!lineNum && lineMap.size > 0) {
         // Just navigate to the file's diff without a specific line
         console.log("[MD Review] No line match found, navigating to file diff");
+      }
+
+      // Refine: if the paragraph spans multiple source lines, the prefix
+      // match returns the first one. Use caret position to land on the
+      // line the user actually clicked on.
+      if (lineNum) {
+        const lineList = _lineListByDigest.get(pathDigest);
+        if (lineList && lineList.length > 0) {
+          const caretRange = _getCaretRange(e);
+          const preText = _strippedTextBeforeCaret(blockTarget, caretRange);
+          if (preText !== null) {
+            const refined = _refineLineByCaretOffset(lineNum, preText.length, lineList);
+            if (refined && refined !== lineNum) {
+              console.log("[MD Review] Refined lineNum by caret:", lineNum, "→", refined);
+              lineNum = refined;
+            }
+          }
+        }
       }
 
       console.log("[MD Review] Resolved lineNum:", lineNum);

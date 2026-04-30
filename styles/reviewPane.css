@@ -286,5 +286,5 @@ tr.md-review-commented-line > td {
 tr.md-review-selected-line > td,
 td.md-review-selected-line,
 a.md-review-selected-line {
-  background: var(--diffBlob-selectedLine-bgColor, #fff8c5) !important;
+  background: rgba(56, 139, 253, 0.25) !important;
 }
