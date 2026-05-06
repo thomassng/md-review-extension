@@ -110,7 +110,7 @@
   }
 
   function _stripMarkdownSyntax(text) {
-    return text
+    let result = text
       // LaTeX math: $$...$$ and $...$ — rendered HTML's textContent for these
       // is unstable (mjx-container produces stacked atoms), so drop the math
       // entirely on both sides for matching.
@@ -125,6 +125,14 @@
       .replace(/`/g, "")
       .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
       .trim();
+    // Table row: `| cell 1 | cell 2 |` → `cell 1 cell 2`. Run after other
+    // strips so cell content is also de-formatted, and matches the rendered
+    // TR text built by _readBlockTextStrippingMath (cells joined by spaces).
+    const tableRowMatch = result.match(/^\|(.+)\|$/);
+    if (tableRowMatch) {
+      result = tableRowMatch[1].replace(/\|/g, " ").replace(/\s+/g, " ").trim();
+    }
+    return result;
   }
 
   // Walk up to find a block-level container. Element.closest() doesn't
@@ -133,8 +141,12 @@
   // null. Walk parentElement explicitly (and traverse shadow hosts) until
   // we hit a paragraph-level block.
   function _findClickedBlock(target) {
+    // TR is the source-line atom for tables (one markdown row = one source
+    // line). TD/TH are deliberately excluded — clicks inside a cell should
+    // bubble to the TR so we match the row's combined cell text against the
+    // pipe-stripped source row.
     const BLOCK_TAGS = new Set([
-      "LI", "P", "H1", "H2", "H3", "H4", "H5", "H6", "TR", "TD", "TH",
+      "LI", "P", "H1", "H2", "H3", "H4", "H5", "H6", "TR",
       "BLOCKQUOTE", "PRE",
     ]);
     let node = target;
@@ -201,6 +213,16 @@
       '.katex, ' +
       '[data-math-style]'
     ).forEach((n) => n.replaceWith(document.createTextNode(" ")));
+    // For table rows, textContent concatenates cells without separators
+    // ("Cell1Cell2"). Join cells with a space so it matches the source row
+    // after _stripMarkdownSyntax pipe-stripping ("cell 1 cell 2").
+    if ((el.tagName || "").toUpperCase() === "TR") {
+      return Array.from(clone.children)
+        .filter((c) => /^(TD|TH)$/i.test(c.tagName || ""))
+        .map((c) => (c.textContent || "").trim())
+        .filter(Boolean)
+        .join(" ");
+    }
     return (clone.textContent || "").trim();
   }
 
